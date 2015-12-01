@@ -1,0 +1,273 @@
+---
+title: "Titanic"
+author: "Adrien Giraud"
+date: "22 November 2015"
+output: html_document
+---
+# 1. Working environment preparation and database loading
+
+## 1.1. Libraries and working directory setting
+```{r warning=FALSE, message =FALSE}
+# Load libraries :
+library(data.table)
+library(ggplot2)
+library(stats)
+library(randomForest)
+library(Hmisc)
+library(Amelia)
+library(party)
+library(methods)
+library(rpart)
+library(gbm)
+my_path <- "/Users/adrien/Documents/axa/titanic"
+setwd(my_path)
+```
+## 1.2. Database loading
+```{r  warning=FALSE }
+missing.types <- c("NA", "")
+train.column.types <- c("integer",   # PassengerId
+                        "factor",    # Survived 
+                        'factor',    # Pclass
+                        'character', # Name
+                        'factor',    # Sex
+                        'numeric',   # Age
+                        'integer',   # SibSp
+                        'integer',   # Parch
+                        'character', # Ticket
+                        'numeric',   # Fare
+                        'character', # Cabin
+                        'factor'     # Embarked
+)
+
+test.column.types <- c('integer',   # PassengerId
+                        'factor',    # Pclass
+                        'character', # Name
+                        'factor',    # Sex
+                        'numeric',   # Age
+                        'integer',   # SibSp
+                        'integer',   # Parch
+                        'character', # Ticket
+                        'numeric',   # Fare
+                        'character', # Cabin
+                        'factor'     # Embarked
+)
+train<-fread("train.csv",sep=",",colClasses=train.column.types,na.strings=c("NA", ""),header=T)
+test<-fread("test.csv",sep=",",colClasses=test.column.types,na.strings=c("NA", ""),header=T)
+```
+
+# 2. Descriptive statistics
+
+## 2.1. Missing data checking 
+```{r  warning=FALSE}
+missmap(train, col=c("yellow", "blue"), legend = FALSE, main = "Training set")
+missmap(test, col=c("yellow", "blue"), legend = FALSE, main = "Test set")
+check.missing<-function(x) return(paste0(round(sum(is.na(x))/length(x),4)*100,'%'))
+data.frame(sapply(train,check.missing))
+data.frame(sapply(test,check.missing))
+```
+Observations :
+
+* roughly 20 percent of the Age data is missing
+* well above 70 percent of the passengers cannot be linked to a specific cabin number. 
+
+Conclusions :
+
+* the proportion of Age "missings" is likely small enough for reasonable replacement with some form of imputation
+* the cabin missings seem too extensive to make reliable imputation possible. 
+
+## 2.2. General data description
+```{r}
+barplot(table(train$Survived),
+        names.arg = c("Perished", "Survived"),
+        main="Survived (passenger fate)",ylab="nb of passengers",col="grey")
+
+barplot(table(train$Pclass), 
+        names.arg = c("first", "second", "third"),
+        main="Passenger traveling class distribution",ylab="nb of passengers",col="grey")
+
+barplot(table(train$Sex), main="Sex (gender)",ylab="nb of passengers",col="grey")
+
+hist(train$Age, main="Age distribution", xlab = "year",col="grey")
+
+barplot(table(train$Embarked), names.arg = c("Cherbourg", "Queenstown", "Southampton"),main="Embarked (port of embarkation)", col="grey")
+```
+
+Observations :
+
+* more passengers perished than survived
+* about twice as many passengers in 3rd class than in either 1st or 2nd
+* male passengers far outnumbered females
+* most passangers joined the vessel at Southampton
+
+
+
+## 2.3. Survival rate
+```{r}
+mosaicplot(train$Sex ~ train$Survived, main="Passenger Survival by Gender",
+           color=c("#8dd3c7", "#fb8072"), shade=FALSE,  xlab="", ylab="",
+           off=c(0), cex.axis=1.4)
+
+mosaicplot(train$Pclass ~ train$Survived, main="Passenger Survival by Class",
+           color=c("#8dd3c7", "#fb8072"), shade=FALSE,  xlab="", ylab="",
+           off=c(0), cex.axis=1.4)
+
+mosaicplot(train$Embarked ~ train$Survived, main="Passenger Survival by port of embarkation",
+           color=c("#8dd3c7", "#fb8072"), shade=FALSE,  xlab="", ylab="",
+           off=c(0), cex.axis=1.4)
+
+```
+
+The following mosaic suggests that :
+
+* gender should certainly prove to be a prominent feature in the final model
+* traveling class did influence the odds of a passenger's survival
+* passenger survival didn't vary as much across the three ports of embarkation as it did between genders and traveling classes
+
+# 3. Data cleaning
+## 3.1. Combine train/test data for pre-processing
+```{r}
+train$Cat<-'train'
+test$Cat<-'test'
+test$Survived<-NA
+full<-rbind(train,test)
+```
+##3.2. Feature engineering
+### 3.2.1. Embarked feature
+```{r} 
+sum(is.na(full$Embarked))
+full$Embarked[is.na(full$Embarked)]<-'S'
+```
+It reveals just two missings.It should be fine to replace those missings with "S", the most common value.
+
+### 3.2.2. Title feature
+
+```{r} 
+
+full$Title <- sapply(full$Name, FUN=function(x) {strsplit(x, split='[,.]')[[1]][2]})
+full$Title <- sub(' ', '', full$Title)
+full$Title[full$Title %in% c('Mme', 'Mlle')] <- 'Mlle'
+full$Title[full$Title %in% c('Capt', 'Don', 'Major', 'Sir')] <- 'Sir'
+full$Title[full$Title %in% c('Dona', 'Lady', 'the Countess', 'Jonkheer')] <- 'Lady'
+full$Title <- factor(full$Title)
+
+```
+
+### Fare Feature 
+```{r} 
+fit.Fare<-rpart(Fare[!is.na(Fare)]~Pclass+Title+Sex+SibSp+Parch,data=full[!is.na(full$Fare),],method='anova')
+```
+### 3.2.3. Age feature
+
+#### First approach
+
+A common approach to this type of situation is to replacing the missings with the average (or the median) of the available values.
+```{r} 
+mean(full$Age,na.rm=T)
+median(full$Age,na.rm=T)
+```
+In this case, that would mean replacing 177 missing Age values with 29.9 (or 28). Taking that approach would be fine if only a small fraction of the ages were missing. However, with missings accounting for 20 percent of all Age data in a relatively small data set (<900 records), one could justify a search for a more refined method of imputation. 
+
+#### Second approach
+We make a prediction of a passengers Age using the other variables and a decision tree model
+
+```{r}
+#feature creation 
+full$FamilySize <- full$SibSp + full$Parch + 1
+
+predicted_age <- rpart(Age ~ Pclass + Sex + SibSp + Parch + Fare + Embarked + Title + FamilySize,
+                       data=full[!is.na(full$Age),], method="anova")
+full$Age[is.na(full$Age)] <- predict(predicted_age, full[is.na(full$Age),])
+```
+
+### 3.2.4. Miscellaneous  feature engineering
+
+```{r}
+
+#Adding Mother
+full$Mother<-0
+full$Mother[full$Sex=='female' & full$Parch>0 & full$Age>18 & full$Title!='Mlle']<-1
+
+#Adding Child
+full$Child<-0
+full$Child[full$Parch>0 & full$Age<=18]<- 1
+
+#Exact Deck from Cabin number
+full$Deck<-sapply(full$Cabin, function(x) strsplit(x,NULL)[[1]][1])
+
+#Excat Position from Cabin number
+full$CabinNum<-sapply(full$Cabin,function(x) strsplit(x,'[A-Z]')[[1]][2])
+full$num<-as.numeric(full$CabinNum)
+num<-full$num[!is.na(full$num)]
+Pos<-kmeans(num,3)
+full$CabinPos[!is.na(full$num)]<-Pos$cluster
+full$CabinPos<-factor(full$CabinPos)
+levels(full$CabinPos)<-c('Front','End','Middle')
+full$num<-NULL
+
+Surname<-sapply(full$Name,function(x) strsplit(x,'[.,]')[[1]][1])
+FamilyId<-paste0(full$FamilySize,Surname)
+full$FamilyId<-factor(FamilyId)
+Family<-data.frame(table(FamilyId))
+SmallFamily<-Family$FamilyId[Family$Freq<=2]
+FamilyId[FamilyId %in% SmallFamily]<-'Small'
+full$FamilyId2<-factor(FamilyId)
+```
+
+###split train/test data
+```{r}
+full<-transform(full,
+                Pclass=factor(Pclass),
+                Sex=factor(Sex),
+                Embarked=factor(Embarked),
+                Title=factor(Title),
+                Mother=factor(Mother),
+                Child=factor(Child),
+                Deck=factor(Deck),
+                FamilyId=factor(FamilyId),
+                FamilyId2=factor(FamilyId2),
+                Survived=factor(Survived)
+                )
+
+
+train<-full[full$Cat=='train',]
+test<-full[full$Cat=='test',]
+
+#randomForest method, (not support variables with too many levels, e.g. FamilyId here)
+#fit.rf<-randomForest(Survived~Pclass+Sex+Age+SibSp+Parch+Fare+Embarked+Title+Mother+Child+Deck,data=train,ntree=1250,importance=T)
+#plot(fit.rf,main='randomForest error rate')
+#imp<-importance(fit.rf,type='1')
+#imp<-imp[order(imp),]
+#(imp)
+#varImpPlot(fit.rf, main="randomForest - variable Importance")
+#
+#write submission
+#test$Survived<-predict(fit.rf,test,OOB=TRUE,type='response')
+#submission<-test[,1:2]
+#write.csv(submission,'submission_randomForest.csv',row.names=F)
+
+
+#cforest (conditional inference tree) method, (support variables with more levels and missing values, with unbiased prediction)
+#fit.cf<-cforest(Survived~FamilyId2+CabinPos+Deck+Pclass+Sex+Age+SibSp+Parch+Fare+Embarked+Title+Mother+Child+Deck,data=train,controls=cforest_unbiased(ntree=500, mtry=3))
+#test$Survived<-predict(fit.cf,test,OOB=TRUE,type='response')
+#submission<-test[,1:2]
+#write.csv(submission,'submission_cforest.csv',row.names=F)
+
+
+fit.gbm<-gbm(Survived~FamilyId2+CabinPos+Deck+Pclass+Sex+Age+SibSp+Parch+Fare+Embarked+Title+Mother+Child+Deck,
+             data=train,
+             distribution="gaussian",
+             n.trees=1000,
+             shrinkage=0.005,
+             bag.fraction=0.7,
+             interaction.depth=3)
+
+preds<-predict(fit.gbm,test,OOB=TRUE,type='response',n.trees=1000)
+normPreds<-(preds-min(preds))/(max(preds)-min(preds))
+test$Survived<-as.numeric(normPreds > 0.5)
+submit <- data.frame(PassengerId = test$PassengerId, Survived = test$Survived)
+write.csv(submit,'submission_gbm.csv',row.names=F)
+
+
+```
+
+
